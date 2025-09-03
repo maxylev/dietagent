@@ -112,15 +112,25 @@ export interface BrowserUseTask {
   screenshots?: string[]
   gif_url?: string
   media_urls?: string[]
+  outputFiles?: Array<{
+    id: string
+    fileName: string
+  }>
 }
 
 export class BrowserUseService {
   private baseUrl = "https://api.browser-use.com/api/v2"
   private apiKey: string | null = null
+  private modelOverride: string | null = null
 
   constructor(apiKey?: string) {
     this.apiKey = apiKey || null
     console.log("BrowserUseService initialized with API key:", apiKey ? "present" : "missing")
+  }
+  
+  setModelOverride(model: string) {
+    this.modelOverride = model
+    console.log(`Model override set to: ${model}`)
   }
 
   setApiKey(apiKey: string) {
@@ -153,14 +163,22 @@ export class BrowserUseService {
   ): Promise<BrowserUseTask> {
     const structuredPrompt = this.createMealPlanPrompt(prompt, preferences)
 
+    // Fix model name to use correct format for Browser-Use API
+    let modelName = this.modelOverride || "gpt-4o";
+    if (modelName === "claude-3.7-sonnet") {
+      modelName = "claude-3-7-sonnet-20250219";
+    }
+
     // Optimize task configuration for production
     const taskData = {
       task: structuredPrompt,
-      llm: "gemini-2.5-flash", // Use the recommended fast model
+      llm: modelName,
       maxSteps: 25, // Increased steps for more thorough research
       maxLLMTokens: 4000, // Set token limit for better cost management
-      structuredOutput: JSON.stringify(this.getMealPlanSchema()),
+      // Removed structuredOutput that was causing the error
       timeoutSeconds: 300, // 5 minute timeout
+      thinking: false, // Disable thinking to reduce token usage
+      vision: true, // Enable vision capabilities
       metadata: {
         type: "meal_plan_generation",
         preferences: JSON.stringify(preferences || {}),
@@ -168,6 +186,8 @@ export class BrowserUseService {
         source: "diet-agent-production"
       }
     }
+
+    console.log(`Creating meal plan task with model: ${taskData.llm}`);
 
     console.log("Creating meal plan task with data:", JSON.stringify(taskData, null, 2))
 
@@ -325,8 +345,76 @@ Please create a detailed meal plan that includes:
 
 Focus on creating healthy, balanced meals with practical recipes. Use common ingredients that are widely available. Provide realistic cost estimates based on typical market prices.
 
-Output Format: Provide a complete JSON structure following the specified schema.
-Be thorough but practical in your meal planning approach.
+Output Format: Provide a complete JSON structure with the following format:
+{
+  "id": "string",
+  "title": "string",
+  "description": "string",
+  "days": number,
+  "people": number,
+  "totalCalories": number,
+  "totalProtein": number,
+  "totalCarbs": number,
+  "totalFat": number,
+  "difficulty": "Easy" | "Medium" | "Hard",
+  "meals": [
+    {
+      "day": number,
+      "breakfast": {
+        "name": "string",
+        "description": "string",
+        "prepTime": number,
+        "cookTime": number,
+        "servings": number,
+        "calories": number,
+        "protein": number,
+        "carbs": number,
+        "fat": number,
+        "ingredients": [
+          {
+            "name": "string",
+            "quantity": "string",
+            "unit": "string",
+            "estimatedPrice": number,
+            "supermarketLinks": [
+              {
+                "supermarket": "string",
+                "url": "string",
+                "price": number
+              }
+            ]
+          }
+        ],
+        "instructions": ["string"],
+        "tips": ["string"],
+        "tags": ["string"]
+      },
+      "lunch": { same structure as breakfast },
+      "dinner": { same structure as breakfast }
+    }
+  ],
+  "estimatedCost": {
+    "min": number,
+    "max": number,
+    "currency": "string"
+  },
+  "supermarkets": [
+    {
+      "name": "string",
+      "country": "string",
+      "website": "string",
+      "deliveryFee": number
+    }
+  ],
+  "nutritionalSummary": {
+    "dailyCalories": number,
+    "dailyProtein": number,
+    "dailyCarbs": number,
+    "dailyFat": number
+  }
+}
+
+Be thorough but practical in your meal planning approach. Make sure your response is valid JSON.
 `
   }
 
@@ -570,8 +658,39 @@ Be thorough and create a complete, realistic shopping cart that the user can imm
     }
   }
 
+  // Get task output file content
+  async getTaskOutputFileContent(taskId: string, fileId: string): Promise<string> {
+    try {
+      // First get the download URL
+      const response = await fetch(`${this.baseUrl}/files/tasks/${taskId}/output-files/${fileId}`, {
+        headers: this.getHeaders()
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Failed to get file download URL: ${response.status} ${response.statusText} - ${errorText}`);
+      }
+      
+      const fileInfo = await response.json();
+      if (!fileInfo.downloadUrl) {
+        throw new Error('No download URL found in file info');
+      }
+      
+      // Now download the file content
+      const fileResponse = await fetch(fileInfo.downloadUrl);
+      if (!fileResponse.ok) {
+        throw new Error(`Failed to download file content: ${fileResponse.status} ${fileResponse.statusText}`);
+      }
+      
+      return await fileResponse.text();
+    } catch (error) {
+      console.error('Error getting task output file content:', error);
+      throw error;
+    }
+  }
+  
   // Validate API key
-  async validateApiKey(): Promise<{valid: boolean, error?: string, credits?: number}> {
+  async validateApiKey(): Promise<{valid: boolean, error?: string, monthlyCreditsBalanceUsd?: number, additionalCreditsBalanceUsd?: number}> {
     try {
       const response = await fetch(`${this.baseUrl}/accounts/me`, {
         headers: this.getHeaders()
@@ -588,11 +707,14 @@ Be thorough and create a complete, realistic shopping cart that the user can imm
       // Try to get account details including credits
       try {
         const accountData = await response.json()
+        console.log("Account data from API:", accountData);
         return {
           valid: true,
-          credits: accountData.credits || accountData.balance || 0
+          monthlyCreditsBalanceUsd: accountData.monthlyCreditsBalanceUsd || 0,
+          additionalCreditsBalanceUsd: accountData.additionalCreditsBalanceUsd || 0
         }
       } catch (parseError) {
+        console.error("Error parsing account data:", parseError);
         // If we can't parse JSON but response was OK, the key is still valid
         return { valid: true }
       }
